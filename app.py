@@ -188,7 +188,7 @@ def filter_dataframe(df: pd.DataFrame, key_prefix: str) -> pd.DataFrame:
             row_cols = st.columns(len(chunk))
             for i, col_name in enumerate(chunk):
                 with row_cols[i]:
-                    cat_cols = ["Ticker", "Stock", "Strategy", "Quarterly Directional Bias", "Daily Directional Bias", "Market Profile / TPO Structure", "Auction Dynamics", "Stock Prediction", "M/E"]
+                    cat_cols = ["Ticker", "Stock", "Strategy", "Quarterly Directional Bias", "Daily Directional Bias", "Market Profile / TPO Structure", "Auction Dynamics", "Stock Prediction"]
                     if col_name in cat_cols:
                         options = sorted(list(filtered_df[col_name].dropna().unique()))
                         selected = st.multiselect(f"Filter {col_name}", options, default=options, key=f"{key_prefix}_{col_name}")
@@ -211,11 +211,49 @@ def fetch_institutional_profile(symbol):
         hist_hourly = tk.history(period="5d", interval="60m")
         info = tk.info or {}
         
-        spot = hist_daily['Close'].iloc[-1]
-        prior_close = hist_daily['Close'].iloc[-2]
-        pre_market = info.get("preMarketPrice") or info.get("regularMarketPrice") or spot
+
+	# 1. Precise Session-Aware Price Resolution (Yesterday Close / Today Regular / Now Real-Time)
+        prior_close = float(hist_daily['Close'].iloc[-2])
+        today_reg = float(hist_daily['Close'].iloc[-1])
+        
+        # Priority 1: High-frequency 1-minute bar with extended hours enabled
+        real_time_now = None
+        try:
+            hist_live = tk.history(period="1d", interval="1m", prepost=True)
+            if not hist_live.empty:
+                real_time_now = float(hist_live['Close'].iloc[-1])
+        except Exception:
+            pass
+
+        # Priority 2: fast_info direct stream
+        if real_time_now is None:
+            try:
+                real_time_now = float(tk.fast_info.get("last_price", 0.0))
+                if real_time_now <= 0:
+                    real_time_now = None
+            except Exception:
+                pass
+
+        # Priority 3: Extended hours quotes from info
+        if real_time_now is None:
+            post_p = info.get("postMarketPrice")
+            pre_p = info.get("preMarketPrice")
+            reg_p = info.get("regularMarketPrice")
+            cur_cand = post_p or pre_p or reg_p or today_reg
+            try:
+                real_time_now = float(cur_cand)
+            except (ValueError, TypeError):
+                real_time_now = today_reg
+
+        # Spot anchor: use actual real-time price if available, otherwise regular close
+        spot = real_time_now if real_time_now and real_time_now > 0 else today_reg
+        dtn_str = f"${prior_close:.2f} / ${today_reg:.2f} / ${spot:.2f}"
+
+
+
         asset_name = info.get("shortName") or info.get("longName") or symbol
         
+        # 2. Fundamentals
         trailing_pe = info.get("trailingPE")
         pe_str = f"{trailing_pe:.1f}x" if trailing_pe else "N/A"
         peg = info.get("pegRatio")
@@ -233,9 +271,10 @@ def fetch_institutional_profile(symbol):
         if earnings_date == "N/A" and "earningsTimestamp" in info and info["earningsTimestamp"]:
             earnings_date = datetime.fromtimestamp(info["earningsTimestamp"]).strftime("%Y-%m-%d")
 
-        ema20 = hist_daily['Close'].ewm(span=20, adjust=False).mean().iloc[-1]
-        sma50 = hist_daily['Close'].rolling(window=50).mean().iloc[-1]
-        sma200 = hist_daily['Close'].rolling(window=200).mean().iloc[-1] if len(hist_daily) >= 200 else np.nan
+        # 3. Moving Averages & Trend
+        ema20 = float(hist_daily['Close'].ewm(span=20, adjust=False).mean().iloc[-1])
+        sma50 = float(hist_daily['Close'].rolling(window=50).mean().iloc[-1])
+        sma200 = float(hist_daily['Close'].rolling(window=200).mean().iloc[-1]) if len(hist_daily) >= 200 else np.nan
         
         if not np.isnan(sma200):
             q_bias = "Bullish" if (spot > sma50 and sma50 > sma200) else ("Bearish" if (spot < sma50 and sma50 < sma200) else "Neutral Consolidation")
@@ -244,30 +283,32 @@ def fetch_institutional_profile(symbol):
             
         d_bias = "Strong Bull" if spot > ema20 * 1.015 else ("Bullish Pullback" if spot > ema20 else ("Bearish" if spot < ema20 * 0.985 else "Neutral Compression"))
 
+        # 4. Momentum (RSI & MACD)
         delta = hist_daily['Close'].diff()
         gain = (delta.where(delta > 0, 0)).rolling(window=14).mean()
         loss = (-delta.where(delta < 0, 0)).rolling(window=14).mean()
         rs = gain / loss
-        rsi = 100 - (100 / (1 + rs)).iloc[-1]
+        rsi = float(100 - (100 / (1 + rs)).iloc[-1])
         
         ema12 = hist_daily['Close'].ewm(span=12, adjust=False).mean()
         ema26 = hist_daily['Close'].ewm(span=26, adjust=False).mean()
         macd_line = ema12 - ema26
         signal_line = macd_line.ewm(span=9, adjust=False).mean()
         macd_hist = macd_line - signal_line
-        macd_val = macd_hist.iloc[-1]
+        macd_val = float(macd_hist.iloc[-1])
         macd_str = "Bullish Expansion" if macd_val > 0 and macd_val > macd_hist.iloc[-2] else ("Bullish Diverging" if macd_val > 0 else ("Bearish Expansion" if macd_val < 0 and macd_val < macd_hist.iloc[-2] else "Bearish Weakening"))
 
-        prior_vol = hist_daily['Volume'].iloc[-2]
+        # 5. Volume Profile & Auction Dynamics
+        prior_vol = float(hist_daily['Volume'].iloc[-2])
         if not hist_hourly.empty:
-            vpoc = hist_hourly.groupby(pd.cut(hist_hourly['Close'], bins=15))['Volume'].sum().idxmax().mid
+            vpoc = float(hist_hourly.groupby(pd.cut(hist_hourly['Close'], bins=15))['Volume'].sum().idxmax().mid)
         else:
-            vpoc = hist_daily['Close'].tail(20).median()
+            vpoc = float(hist_daily['Close'].tail(20).median())
             
         recent_20 = hist_daily.tail(20)
         daily_rng = recent_20['High'] - recent_20['Low']
-        avg_rng = daily_rng.mean()
-        last_rng = daily_rng.iloc[-1]
+        avg_rng = float(daily_rng.mean())
+        last_rng = float(daily_rng.iloc[-1])
         
         if last_rng > avg_rng * 1.3:
             tpo_structure = "Trend Day (Single Prints)"
@@ -279,7 +320,8 @@ def fetch_institutional_profile(symbol):
             tpo_structure = "Neutral-Extreme (Distribution)"
             auction_dyn = "Responsive Absorption"
 
-        pivot = (recent_20['High'].max() + recent_20['Low'].min() + spot) / 3
+        # 6. Technical S/R Levels
+        pivot = float((recent_20['High'].max() + recent_20['Low'].min() + spot) / 3)
         tr = np.maximum(
             hist_daily['High'] - hist_daily['Low'],
             np.maximum(
@@ -287,20 +329,21 @@ def fetch_institutional_profile(symbol):
                 abs(hist_daily['Low'] - hist_daily['Close'].shift(1))
             )
         )
-        atr14 = tr.rolling(window=14).mean().iloc[-1]
+        atr14 = float(tr.rolling(window=14).mean().iloc[-1])
         
         s1 = round(spot - (atr14 * 0.75), 2)
         s2 = round(spot - (atr14 * 1.5), 2)
-        s3 = round(recent_20['Low'].min(), 2)
+        s3 = round(float(recent_20['Low'].min()), 2)
         
         r1 = round(spot + (atr14 * 0.75), 2)
         r2 = round(spot + (atr14 * 1.5), 2)
-        r3 = round(recent_20['High'].max(), 2)
+        r3 = round(float(recent_20['High'].max()), 2)
         
+        # 7. Volatility & IVR
         log_ret = np.log(hist_daily['Close'] / hist_daily['Close'].shift(1)).dropna()
-        hv30 = log_ret.tail(30).std() * math.sqrt(252) * 100
+        hv30 = float(log_ret.tail(30).std() * math.sqrt(252) * 100)
         hv_rolling = log_ret.rolling(window=30).std() * math.sqrt(252) * 100
-        hv_min, hv_max = hv_rolling.min(), hv_rolling.max()
+        hv_min, hv_max = float(hv_rolling.min()), float(hv_rolling.max())
         ivr = 100 * (hv30 - hv_min) / (hv_max - hv_min) if hv_max > hv_min else 25.0
         
         opt_vol = 0
@@ -314,7 +357,7 @@ def fetch_institutional_profile(symbol):
                 call_v = chain.calls['volume'].fillna(0).sum()
                 put_v = chain.puts['volume'].fillna(0).sum()
                 opt_vol = int(call_v + put_v)
-                pcr = round(put_v / call_v, 2) if call_v > 0 else 1.0
+                pcr = round(float(put_v / call_v), 2) if call_v > 0 else 1.0
         except Exception:
             pass
 
@@ -325,8 +368,7 @@ def fetch_institutional_profile(symbol):
         return {
             "Ticker": symbol,
             "Asset Name": asset_name,
-            "Prior Close": f"${prior_close:.2f}",
-            "Pre-Market Price": f"${pre_market:.2f}",
+            "1 D/T/N": dtn_str,
             "PEG ratio": peg_str,
             "Earnings Date": earnings_date,
             "Price-to-Earnings (P/E)": pe_str,
@@ -361,7 +403,8 @@ def fetch_institutional_profile(symbol):
     except Exception:
         return None
 
-# --- RESILIENT OPTIONS ENGINE (15 TO 45 DTE WINDOW / POP >= 70%) ---
+
+# --- RESILIENT OPTIONS ENGINE (EXPANDED STRATEGY CATALOG / 19-COLUMN SCHEMA) ---
 def scan_derivatives_strategy(symbol, raw_spot, s1, r1, earnings_date, stock_prediction, strategy_name, book_type):
     try:
         tk = yf.Ticker(symbol)
@@ -371,7 +414,6 @@ def scan_derivatives_strategy(symbol, raw_spot, s1, r1, earnings_date, stock_pre
         
         now = datetime.now()
         cur_date_str = now.strftime("%Y-%m-%d")
-        me_session = "M" if now.hour < 12 else "E"
         
         target_expiries = []
         for e in expiries:
@@ -410,7 +452,7 @@ def scan_derivatives_strategy(symbol, raw_spot, s1, r1, earnings_date, stock_pre
                 continue
 
             # ==========================================
-            # 1. CREDIT STRATEGIES (NET SELLERS / POP >= 70%)
+            # 1. EXPANDED CREDIT STRATEGIES
             # ==========================================
             if book_type == "Credit":
                 if "Bull Put Credit Spread" in strategy_name:
@@ -422,17 +464,15 @@ def scan_derivatives_strategy(symbol, raw_spot, s1, r1, earnings_date, stock_pre
                         if not l_row.empty:
                             actual_long_k = float(l_row.iloc[0]['strike'])
                             actual_gap = actual_short_k - actual_long_k
-                            s_mid = get_clean_mid(s_row)
-                            l_mid = get_clean_mid(l_row)
-                            net_credit = max(round(s_mid - l_mid, 2), 0.25)
+                            net_credit = max(round(get_clean_mid(s_row) - get_clean_mid(l_row), 2), 0.25)
                             max_loss = round((actual_gap - net_credit) * 100, 2)
                             results.append({
-                                "Date": cur_date_str, "M/E": me_session, "Stock": symbol, "Earnings": earnings_date,
+                                "Date": cur_date_str, "Stock": symbol, "Earnings": earnings_date,
                                 "Support": f"${s1:.2f}", "Resistance": f"${r1:.2f}", "Stock Prediction": stock_prediction,
                                 "Strategy": f"Bull Put Spread (${actual_gap:.0f} Gap)", "Expiry": f"{exp} ({dte}d)",
                                 "#Contract": 1, "Long Put": f"${actual_long_k:.0f}", "Short Put": f"${actual_short_k:.0f}",
                                 "Short Call": "—", "Long Call": "—", "Premium": f"${net_credit:.2f}",
-                                "Total Premium": f"${net_credit * 100:.2f}", "Sold Idea": "OTM Put Credit below S1 (POP ~78%)",
+                                "Total Premium": f"${net_credit * 100:.2f}", "Sold Idea": "OTM Put Credit below S1 Support (POP ~78%)",
                                 "Profit": f"${net_credit * 100:.2f}", "Loss": f"${max_loss:.2f}",
                                 "Comments": f"Buffer: {((raw_spot - actual_short_k)/raw_spot)*100:.1f}%. Target 50% max profit exit."
                             })
@@ -447,19 +487,17 @@ def scan_derivatives_strategy(symbol, raw_spot, s1, r1, earnings_date, stock_pre
                         if not l_row.empty:
                             actual_long_k = float(l_row.iloc[0]['strike'])
                             actual_gap = actual_long_k - actual_short_k
-                            s_mid = get_clean_mid(s_row)
-                            l_mid = get_clean_mid(l_row)
-                            net_credit = max(round(s_mid - l_mid, 2), 0.25)
+                            net_credit = max(round(get_clean_mid(s_row) - get_clean_mid(l_row), 2), 0.25)
                             max_loss = round((actual_gap - net_credit) * 100, 2)
                             results.append({
-                                "Date": cur_date_str, "M/E": me_session, "Stock": symbol, "Earnings": earnings_date,
+                                "Date": cur_date_str, "Stock": symbol, "Earnings": earnings_date,
                                 "Support": f"${s1:.2f}", "Resistance": f"${r1:.2f}", "Stock Prediction": stock_prediction,
                                 "Strategy": f"Bear Call Spread (${actual_gap:.0f} Gap)", "Expiry": f"{exp} ({dte}d)",
                                 "#Contract": 1, "Long Put": "—", "Short Put": "—",
                                 "Short Call": f"${actual_short_k:.0f}", "Long Call": f"${actual_long_k:.0f}",
                                 "Premium": f"${net_credit:.2f}", "Total Premium": f"${net_credit * 100:.2f}",
-                                "Sold Idea": "OTM Call Credit above R1 (POP ~77%)", "Profit": f"${net_credit * 100:.2f}",
-                                "Loss": f"${max_loss:.2f}", "Comments": f"Buffer: {((actual_short_k - raw_spot)/raw_spot)*100:.1f}%. Close at 50% profit."
+                                "Sold Idea": "OTM Call Credit above R1 Resistance (POP ~77%)", "Profit": f"${net_credit * 100:.2f}",
+                                "Loss": f"${max_loss:.2f}", "Comments": f"Buffer: {((actual_short_k - raw_spot)/raw_spot)*100:.1f}%. Manage at 50% profit."
                             })
                             break
 
@@ -480,7 +518,7 @@ def scan_derivatives_strategy(symbol, raw_spot, s1, r1, earnings_date, stock_pre
                             tot_credit = round(cr_p + cr_c, 2)
                             max_loss = round((wing_p - tot_credit) * 100, 2)
                             results.append({
-                                "Date": cur_date_str, "M/E": me_session, "Stock": symbol, "Earnings": earnings_date,
+                                "Date": cur_date_str, "Stock": symbol, "Earnings": earnings_date,
                                 "Support": f"${s1:.2f}", "Resistance": f"${r1:.2f}", "Stock Prediction": stock_prediction,
                                 "Strategy": f"Iron Condor (${wing_p:.0f} Wings)", "Expiry": f"{exp} ({dte}d)",
                                 "#Contract": 1, "Long Put": f"${long_p:.0f}", "Short Put": f"${short_p:.0f}",
@@ -492,13 +530,40 @@ def scan_derivatives_strategy(symbol, raw_spot, s1, r1, earnings_date, stock_pre
                             })
                             break
 
+                elif "Iron Butterfly" in strategy_name:
+                    atm_c_row = get_nearest(chain.calls, raw_spot)
+                    atm_p_row = get_nearest(chain.puts, raw_spot)
+                    if not atm_c_row.empty and not atm_p_row.empty:
+                        pin_k = float(atm_c_row.iloc[0]['strike'])
+                        lp_row = get_nearest(chain.puts[chain.puts['strike'] < pin_k], pin_k - gap)
+                        lc_row = get_nearest(chain.calls[chain.calls['strike'] > pin_k], pin_k + gap)
+                        if not lp_row.empty and not lc_row.empty:
+                            long_p = float(lp_row.iloc[0]['strike'])
+                            long_c = float(lc_row.iloc[0]['strike'])
+                            c_p = max(get_clean_mid(atm_p_row) - get_clean_mid(lp_row), 0.20)
+                            c_c = max(get_clean_mid(atm_c_row) - get_clean_mid(lc_row), 0.20)
+                            tot_credit = round(c_p + c_c, 2)
+                            max_loss = round((gap - tot_credit) * 100, 2)
+                            results.append({
+                                "Date": cur_date_str, "Stock": symbol, "Earnings": earnings_date,
+                                "Support": f"${s1:.2f}", "Resistance": f"${r1:.2f}", "Stock Prediction": stock_prediction,
+                                "Strategy": f"Iron Butterfly (${gap:.0f} Wings)", "Expiry": f"{exp} ({dte}d)",
+                                "#Contract": 1, "Long Put": f"${long_p:.0f}", "Short Put": f"${pin_k:.0f}",
+                                "Short Call": f"${pin_k:.0f}", "Long Call": f"${long_c:.0f}",
+                                "Premium": f"${tot_credit:.2f}", "Total Premium": f"${tot_credit * 100:.2f}",
+                                "Sold Idea": "High-Credit Pin Harvest at Fair Value/POC",
+                                "Profit": f"${tot_credit * 100:.2f}", "Loss": f"${max_loss:.2f}",
+                                "Comments": f"Optimal pin near ${pin_k:.0f}. Close at 35%-40% max profit."
+                            })
+                            break
+
                 elif "Covered Call" in strategy_name:
                     c_row = get_nearest(chain.calls, raw_spot * 1.05)
                     if not c_row.empty:
                         target_k = float(c_row.iloc[0]['strike'])
                         mid = round(get_clean_mid(c_row), 2)
                         results.append({
-                            "Date": cur_date_str, "M/E": me_session, "Stock": symbol, "Earnings": earnings_date,
+                            "Date": cur_date_str, "Stock": symbol, "Earnings": earnings_date,
                             "Support": f"${s1:.2f}", "Resistance": f"${r1:.2f}", "Stock Prediction": stock_prediction,
                             "Strategy": "Covered Call / Buy-Write", "Expiry": f"{exp} ({dte}d)",
                             "#Contract": 1, "Long Put": "—", "Short Put": "—",
@@ -507,7 +572,25 @@ def scan_derivatives_strategy(symbol, raw_spot, s1, r1, earnings_date, stock_pre
                             "Sold Idea": "Income generation against 100 shares capped at R1",
                             "Profit": f"${round((target_k - raw_spot + mid) * 100, 2):.2f}",
                             "Loss": f"${round((raw_spot - mid) * 100, 2):.2f}",
-                            "Comments": f"Upside capped at ${target_k:.0f}. Downside hedge:${mid:.2f}/sh."
+                            "Comments": f"Upside capped at ${target_k:.0f}. Downside hedge: ${mid:.2f}/sh."
+                        })
+                        break
+
+                elif "Cash-Secured Put" in strategy_name:
+                    p_row = get_nearest(chain.puts, raw_spot * 0.90)
+                    if not p_row.empty:
+                        target_k = float(p_row.iloc[0]['strike'])
+                        mid = round(get_clean_mid(p_row), 2)
+                        results.append({
+                            "Date": cur_date_str, "Stock": symbol, "Earnings": earnings_date,
+                            "Support": f"${s1:.2f}", "Resistance": f"${r1:.2f}", "Stock Prediction": stock_prediction,
+                            "Strategy": "Cash-Secured Put (Target Buy)", "Expiry": f"{exp} ({dte}d)",
+                            "#Contract": 1, "Long Put": "—", "Short Put": f"${target_k:.0f}",
+                            "Short Call": "—", "Long Call": "—",
+                            "Premium": f"${mid:.2f}", "Total Premium": f"${mid * 100:.2f}",
+                            "Sold Idea": "Acquire shares below S2 support at net discount",
+                            "Profit": f"${mid * 100:.2f}", "Loss": f"${round((target_k - mid) * 100, 2):.2f}",
+                            "Comments": f"Effective buy price: ${target_k - mid:.2f}. Capital req: ${target_k * 100:.2f}."
                         })
                         break
 
@@ -524,31 +607,59 @@ def scan_derivatives_strategy(symbol, raw_spot, s1, r1, earnings_date, stock_pre
                             c_credit = max(get_clean_mid(sc_row) - get_clean_mid(lc_row), 0.15)
                             tot_credit = round(p_mid + c_credit, 2)
                             results.append({
-                                "Date": cur_date_str, 
-                                "M/E": me_session, 
-                                "Stock": symbol, 
-                                "Earnings": earnings_date,
-                                "Support": f"${s1:.2f}", 
-                                "Resistance": f"${r1:.2f}", 
-                                "Stock Prediction": stock_prediction,
-                                "Strategy": f"Jade Lizard (${long_c - short_c:.0f} Call Spread)", 
-                                "Expiry": f"{exp} ({dte}d)",
-                                "#Contract": 1, 
-                                "Long Put": "—", 
-                                "Short Put": f"${short_p:.0f}",
-                                "Short Call": f"${short_c:.0f}", 
-                                "Long Call": f"${long_c:.0f}",
-                                "Premium": f"${tot_credit:.2f}", 
-                                "Total Premium": f"${tot_credit * 100:.2f}",
+                                "Date": cur_date_str, "Stock": symbol, "Earnings": earnings_date,
+                                "Support": f"${s1:.2f}", "Resistance": f"${r1:.2f}", "Stock Prediction": stock_prediction,
+                                "Strategy": f"Jade Lizard (${long_c - short_c:.0f} Call Spread)", "Expiry": f"{exp} ({dte}d)",
+                                "#Contract": 1, "Long Put": "—", "Short Put": f"${short_p:.0f}",
+                                "Short Call": f"${short_c:.0f}", "Long Call": f"${long_c:.0f}",
+                                "Premium": f"${tot_credit:.2f}", "Total Premium": f"${tot_credit * 100:.2f}",
                                 "Sold Idea": "Zero Upside Risk structure (Credit >= Call Width)",
-                                "Profit": f"${tot_credit * 100:.2f}", 
-                                "Loss": f"${round((short_p - tot_credit) * 100, 2):.2f}",
+                                "Profit": f"${tot_credit * 100:.2f}", "Loss": f"${round((short_p - tot_credit) * 100, 2):.2f}",
                                 "Comments": f"No upside loss. Downside risk starts below ${short_p - tot_credit:.2f}."
                             })
                             break
 
+                elif "Short Strangle" in strategy_name:
+                    sp_row = get_nearest(chain.puts, raw_spot * 0.88)
+                    sc_row = get_nearest(chain.calls, raw_spot * 1.12)
+                    if not sp_row.empty and not sc_row.empty:
+                        short_p = float(sp_row.iloc[0]['strike'])
+                        short_c = float(sc_row.iloc[0]['strike'])
+                        tot_credit = round(get_clean_mid(sp_row) + get_clean_mid(sc_row), 2)
+                        results.append({
+                            "Date": cur_date_str, "Stock": symbol, "Earnings": earnings_date,
+                            "Support": f"${s1:.2f}", "Resistance": f"${r1:.2f}", "Stock Prediction": stock_prediction,
+                            "Strategy": "Short Strangle (High IV Seller)", "Expiry": f"{exp} ({dte}d)",
+                            "#Contract": 1, "Long Put": "—", "Short Put": f"${short_p:.0f}",
+                            "Short Call": f"${short_c:.0f}", "Long Call": "—",
+                            "Premium": f"${tot_credit:.2f}", "Total Premium": f"${tot_credit * 100:.2f}",
+                            "Sold Idea": "Volatility Implosion & Wide Strangle Wing Harvest",
+                            "Profit": f"${tot_credit * 100:.2f}", "Loss": "Undefined (Margin)",
+                            "Comments": f"Breakevens: ${short_p - tot_credit:.2f} to ${short_c + tot_credit:.2f}. Close at 50% max profit."
+                        })
+                        break
+
+                elif "Short Straddle" in strategy_name:
+                    atm_c = get_nearest(chain.calls, raw_spot)
+                    atm_p = get_nearest(chain.puts, raw_spot)
+                    if not atm_c.empty and not atm_p.empty:
+                        pin_k = float(atm_c.iloc[0]['strike'])
+                        tot_credit = round(get_clean_mid(atm_c) + get_clean_mid(atm_p), 2)
+                        results.append({
+                            "Date": cur_date_str, "Stock": symbol, "Earnings": earnings_date,
+                            "Support": f"${s1:.2f}", "Resistance": f"${r1:.2f}", "Stock Prediction": stock_prediction,
+                            "Strategy": "Short Straddle (Maximum Premium)", "Expiry": f"{exp} ({dte}d)",
+                            "#Contract": 1, "Long Put": "—", "Short Put": f"${pin_k:.0f}",
+                            "Short Call": f"${pin_k:.0f}", "Long Call": "—",
+                            "Premium": f"${tot_credit:.2f}", "Total Premium": f"${tot_credit * 100:.2f}",
+                            "Sold Idea": "Pure Volatility Implosion pinned at Fair Value",
+                            "Profit": f"${tot_credit * 100:.2f}", "Loss": "Undefined (Margin)",
+                            "Comments": f"Manage early at 25%-30% max profit. Breakeven +/-${tot_credit:.2f}."
+                        })
+                        break
+
             # ==========================================
-            # 2. DEBIT STRATEGIES (NET BUYERS)
+            # 2. EXPANDED DEBIT STRATEGIES
             # ==========================================
             elif book_type == "Debit":
                 if "Bull Call Debit Spread" in strategy_name:
@@ -559,12 +670,10 @@ def scan_derivatives_strategy(symbol, raw_spot, s1, r1, earnings_date, stock_pre
                         if not s_row.empty:
                             short_k = float(s_row.iloc[0]['strike'])
                             spread_w = short_k - long_k
-                            l_mid = get_clean_mid(l_row)
-                            s_mid = get_clean_mid(s_row)
-                            net_debit = min(max(round(l_mid - s_mid, 2), 0.35), spread_w - 0.10)
+                            net_debit = min(max(round(get_clean_mid(l_row) - get_clean_mid(s_row), 2), 0.35), spread_w - 0.10)
                             max_profit = round((spread_w - net_debit) * 100, 2)
                             results.append({
-                                "Date": cur_date_str, "M/E": me_session, "Stock": symbol, "Earnings": earnings_date,
+                                "Date": cur_date_str, "Stock": symbol, "Earnings": earnings_date,
                                 "Support": f"${s1:.2f}", "Resistance": f"${r1:.2f}", "Stock Prediction": stock_prediction,
                                 "Strategy": f"Bull Call Debit Spread (${spread_w:.0f} Gap)", "Expiry": f"{exp} ({dte}d)",
                                 "#Contract": 1, "Long Put": "—", "Short Put": "—",
@@ -584,12 +693,10 @@ def scan_derivatives_strategy(symbol, raw_spot, s1, r1, earnings_date, stock_pre
                         if not s_row.empty:
                             short_k = float(s_row.iloc[0]['strike'])
                             spread_w = long_k - short_k
-                            l_mid = get_clean_mid(l_row)
-                            s_mid = get_clean_mid(s_row)
-                            net_debit = min(max(round(l_mid - s_mid, 2), 0.35), spread_w - 0.10)
+                            net_debit = min(max(round(get_clean_mid(l_row) - get_clean_mid(s_row), 2), 0.35), spread_w - 0.10)
                             max_profit = round((spread_w - net_debit) * 100, 2)
                             results.append({
-                                "Date": cur_date_str, "M/E": me_session, "Stock": symbol, "Earnings": earnings_date,
+                                "Date": cur_date_str, "Stock": symbol, "Earnings": earnings_date,
                                 "Support": f"${s1:.2f}", "Resistance": f"${r1:.2f}", "Stock Prediction": stock_prediction,
                                 "Strategy": f"Bear Put Debit Spread (${spread_w:.0f} Gap)", "Expiry": f"{exp} ({dte}d)",
                                 "#Contract": 1, "Long Put": f"${long_k:.0f}", "Short Put": f"${short_k:.0f}",
@@ -607,7 +714,7 @@ def scan_derivatives_strategy(symbol, raw_spot, s1, r1, earnings_date, stock_pre
                         atm_k = float(c_row.iloc[0]['strike'])
                         mid = round(get_clean_mid(c_row), 2)
                         results.append({
-                            "Date": cur_date_str, "M/E": me_session, "Stock": symbol, "Earnings": earnings_date,
+                            "Date": cur_date_str, "Stock": symbol, "Earnings": earnings_date,
                             "Support": f"${s1:.2f}", "Resistance": f"${r1:.2f}", "Stock Prediction": stock_prediction,
                             "Strategy": f"Long ATM Call (${atm_k:.0f} Strike)", "Expiry": f"{exp} ({dte}d)",
                             "#Contract": 1, "Long Put": "—", "Short Put": "—", "Short Call": "—",
@@ -615,6 +722,24 @@ def scan_derivatives_strategy(symbol, raw_spot, s1, r1, earnings_date, stock_pre
                             "Sold Idea": "High-Conviction Directional Trend Continuation",
                             "Profit": "Unlimited", "Loss": f"${mid * 100:.2f}",
                             "Comments": f"Breakeven at ${atm_k + mid:.2f}. Cut loss if spot breaks below S1."
+                        })
+                        break
+
+                elif "Long Directional Single Put" in strategy_name:
+                    p_row = get_nearest(chain.puts, raw_spot)
+                    if not p_row.empty:
+                        atm_k = float(p_row.iloc[0]['strike'])
+                        mid = round(get_clean_mid(p_row), 2)
+                        results.append({
+                            "Date": cur_date_str, "Stock": symbol, "Earnings": earnings_date,
+                            "Support": f"${s1:.2f}", "Resistance": f"${r1:.2f}", "Stock Prediction": stock_prediction,
+                            "Strategy": f"Long ATM Put (${atm_k:.0f} Strike)", "Expiry": f"{exp} ({dte}d)",
+                            "#Contract": 1, "Long Put": f"${atm_k:.0f}", "Short Put": "—",
+                            "Short Call": "—", "Long Call": "—",
+                            "Premium": f"${mid:.2f}", "Total Premium": f"${mid * 100:.2f}",
+                            "Sold Idea": "High-Conviction Directional Breakdown Hedge",
+                            "Profit": f"${round((atm_k - mid) * 100, 2):.2f}", "Loss": f"${mid * 100:.2f}",
+                            "Comments": f"Breakeven at ${atm_k - mid:.2f}. Cut loss if spot reclaims R1."
                         })
                         break
 
@@ -633,7 +758,7 @@ def scan_derivatives_strategy(symbol, raw_spot, s1, r1, earnings_date, stock_pre
                             s_mid = get_clean_mid(sc)
                             net_debit = round(l_mid - s_mid, 2)
                             results.append({
-                                "Date": cur_date_str, "M/E": me_session, "Stock": symbol, "Earnings": earnings_date,
+                                "Date": cur_date_str, "Stock": symbol, "Earnings": earnings_date,
                                 "Support": f"${s1:.2f}", "Resistance": f"${r1:.2f}", "Stock Prediction": stock_prediction,
                                 "Strategy": "Poor Man's Covered Call (PMCC)", "Expiry": f"{exp} ({dte}d) / {l_exp} ({l_dte}d)",
                                 "#Contract": 1, "Long Put": "—", "Short Put": "—",
@@ -645,7 +770,7 @@ def scan_derivatives_strategy(symbol, raw_spot, s1, r1, earnings_date, stock_pre
                             })
                             break
 
-                elif "Long Calendar Spread" in strategy_name:
+                elif "Long Call Calendar Spread" in strategy_name:
                     back_exps = [e for e in expiries if 40 <= (datetime.strptime(e, "%Y-%m-%d") - now).days <= 80]
                     if back_exps:
                         b_exp = back_exps[0]
@@ -657,7 +782,7 @@ def scan_derivatives_strategy(symbol, raw_spot, s1, r1, earnings_date, stock_pre
                             atm_k = float(sc.iloc[0]['strike'])
                             net_debit = round(max(get_clean_mid(bc) - get_clean_mid(sc), 0.50), 2)
                             results.append({
-                                "Date": cur_date_str, "M/E": me_session, "Stock": symbol, "Earnings": earnings_date,
+                                "Date": cur_date_str, "Stock": symbol, "Earnings": earnings_date,
                                 "Support": f"${s1:.2f}", "Resistance": f"${r1:.2f}", "Stock Prediction": stock_prediction,
                                 "Strategy": f"Long Call Calendar Spread (${atm_k:.0f}K)", "Expiry": f"{exp} ({dte}d) / {b_exp} ({b_dte}d)",
                                 "#Contract": 1, "Long Put": "—", "Short Put": "—",
@@ -668,6 +793,69 @@ def scan_derivatives_strategy(symbol, raw_spot, s1, r1, earnings_date, stock_pre
                                 "Comments": f"Optimal exit at front expiration near ${atm_k:.0f}."
                             })
                             break
+
+                elif "Long Put Calendar Spread" in strategy_name:
+                    back_exps = [e for e in expiries if 40 <= (datetime.strptime(e, "%Y-%m-%d") - now).days <= 80]
+                    if back_exps:
+                        b_exp = back_exps[0]
+                        b_dte = (datetime.strptime(b_exp, "%Y-%m-%d") - now).days
+                        b_chain = tk.option_chain(b_exp).puts
+                        sp = get_nearest(chain.puts, s1)
+                        bp = get_nearest(b_chain, s1)
+                        if not sp.empty and not bp.empty:
+                            target_k = float(sp.iloc[0]['strike'])
+                            net_debit = round(max(get_clean_mid(bp) - get_clean_mid(sp), 0.50), 2)
+                            results.append({
+                                "Date": cur_date_str, "Stock": symbol, "Earnings": earnings_date,
+                                "Support": f"${s1:.2f}", "Resistance": f"${r1:.2f}", "Stock Prediction": stock_prediction,
+                                "Strategy": f"Long Put Calendar Spread (${target_k:.0f}K)", "Expiry": f"{exp} ({dte}d) / {b_exp} ({b_dte}d)",
+                                "#Contract": 1, "Long Put": f"${target_k:.0f} (Back)", "Short Put": f"${target_k:.0f}",
+                                "Short Call": "—", "Long Call": "—",
+                                "Premium": f"${net_debit:.2f}", "Total Premium": f"${net_debit * 100:.2f}",
+                                "Sold Idea": "Bearish drift toward S1 Support with expanding Vega",
+                                "Profit": f"${round(net_debit * 0.45 * 100, 2):.2f}", "Loss": f"${net_debit * 100:.2f}",
+                                "Comments": f"Target exit at front expiration if spot rests near ${target_k:.0f}."
+                            })
+                            break
+
+                elif "Long Straddle" in strategy_name:
+                    atm_c = get_nearest(chain.calls, raw_spot)
+                    atm_p = get_nearest(chain.puts, raw_spot)
+                    if not atm_c.empty and not atm_p.empty:
+                        pin_k = float(atm_c.iloc[0]['strike'])
+                        tot_debit = round(get_clean_mid(atm_c) + get_clean_mid(atm_p), 2)
+                        results.append({
+                            "Date": cur_date_str, "Stock": symbol, "Earnings": earnings_date,
+                            "Support": f"${s1:.2f}", "Resistance": f"${r1:.2f}", "Stock Prediction": stock_prediction,
+                            "Strategy": "Long Straddle (Volatility Expansion)", "Expiry": f"{exp} ({dte}d)",
+                            "#Contract": 1, "Long Put": f"${pin_k:.0f}", "Short Put": "—",
+                            "Short Call": "—", "Long Call": f"${pin_k:.0f}",
+                            "Premium": f"${tot_debit:.2f}", "Total Premium": f"${tot_debit * 100:.2f}",
+                            "Sold Idea": "Asymmetric Volatility Expansion / Breakout",
+                            "Profit": "Unlimited", "Loss": f"${tot_debit * 100:.2f}",
+                            "Comments": f"Requires move > +/-${tot_debit:.2f} to profit. Close before IV crush."
+                        })
+                        break
+
+                elif "Long Strangle" in strategy_name:
+                    lp_row = get_nearest(chain.puts, raw_spot * 0.94)
+                    lc_row = get_nearest(chain.calls, raw_spot * 1.06)
+                    if not lp_row.empty and not lc_row.empty:
+                        long_p = float(lp_row.iloc[0]['strike'])
+                        long_c = float(lc_row.iloc[0]['strike'])
+                        tot_debit = round(get_clean_mid(lp_row) + get_clean_mid(lc_row), 2)
+                        results.append({
+                            "Date": cur_date_str, "Stock": symbol, "Earnings": earnings_date,
+                            "Support": f"${s1:.2f}", "Resistance": f"${r1:.2f}", "Stock Prediction": stock_prediction,
+                            "Strategy": "Long Strangle (Tail Risk Breakout)", "Expiry": f"{exp} ({dte}d)",
+                            "#Contract": 1, "Long Put": f"${long_p:.0f}", "Short Put": "—",
+                            "Short Call": "—", "Long Call": f"${long_c:.0f}",
+                            "Premium": f"${tot_debit:.2f}", "Total Premium": f"${tot_debit * 100:.2f}",
+                            "Sold Idea": "Outsized Tail Move capture across earnings or macro shock",
+                            "Profit": "Unlimited", "Loss": f"${tot_debit * 100:.2f}",
+                            "Comments": f"Cheaper than Straddle. Profits if spot breaches ${long_p - tot_debit:.2f} or ${long_c + tot_debit:.2f}."
+                        })
+                        break
 
         return results
     except Exception:
@@ -748,7 +936,7 @@ with st.spinner("Compiling technicals, auction dynamics, and profile levels acro
 if review_rows:
     master_df = pd.DataFrame(review_rows)
     master_cols = [
-        "Ticker", "Asset Name", "Prior Close", "Pre-Market Price", "PEG ratio",
+        "Ticker", "Asset Name", "1 D/T/N", "PEG ratio",
         "Earnings Date", "Price-to-Earnings (P/E)", "Quarterly Directional Bias",
         "Daily Directional Bias", "Market Profile / TPO Structure", "Current POC / VPOC",
         "Auction Dynamics", "Support 1 (S1)", "Support 2 (S2)", "Support 3 (S3 / Macro Support)",
@@ -758,14 +946,133 @@ if review_rows:
         "Expected Move (+/-)", "Bull Trigger & Target", "Bear Trigger & Target", "30-Day Outlook Target"
     ]
     display_df = master_df[master_cols]
+
+    # Quick Ticker Filter
+    all_avail_tickers = sorted(list(display_df["Ticker"].unique()))
+    quick_tickers = st.multiselect(
+        "🎯 Quick Ticker Filter (Pick 1 or many for instant view):",
+        options=all_avail_tickers,
+        default=[],
+        placeholder="Select ticker(s) e.g., NVDA, AMD..."
+    )
+    if quick_tickers:
+        display_df = display_df[display_df["Ticker"].isin(quick_tickers)]
+
     filtered_master_df = filter_dataframe(display_df, key_prefix="matrix")
-    st.dataframe(filtered_master_df, use_container_width=True, hide_index=True)
+
+    # 20-Row Pagination
+    ROWS_PER_PAGE = 20
+    total_rows = len(filtered_master_df)
+    total_pages = max(1, math.ceil(total_rows / ROWS_PER_PAGE))
+
+    if total_pages > 1:
+        p_col1, p_col2, p_col3 = st.columns([1, 2, 5])
+        with p_col1:
+            page_num = st.number_input("Page", min_value=1, max_value=total_pages, value=1, step=1)
+        with p_col2:
+            st.markdown(f"<div style='padding-top: 2rem; font-weight: 600;'>Showing page {page_num} of {total_pages} ({total_rows} total rows)</div>", unsafe_allow_html=True)
+    else:
+        page_num = 1
+
+    start_idx = (page_num - 1) * ROWS_PER_PAGE
+    end_idx = start_idx + ROWS_PER_PAGE
+    paged_df = filtered_master_df.iloc[start_idx:end_idx]
+
+    # Sticky Columns CSS: Frozen Columns 1 (Ticker), 2 (Asset Name), 3 (1 D/T/N)
+    html_code = """
+    <style>
+        .custom-grid-container {
+            max-width: 100%;
+            overflow-x: auto;
+            max-height: 800px;
+            overflow-y: auto;
+            border: 1px solid #2e3546;
+            border-radius: 8px;
+            background-color: #0e1117;
+            margin-bottom: 1rem;
+        }
+        .frozen-table {
+            border-collapse: collapse;
+            width: 100%;
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+            font-size: 0.85rem;
+            color: #fafafa;
+            white-space: nowrap;
+        }
+        .frozen-table th, .frozen-table td {
+            padding: 8px 14px;
+            border-bottom: 1px solid #232734;
+            text-align: left;
+        }
+        .frozen-table th {
+            background-color: #161b26;
+            font-weight: 600;
+            position: sticky;
+            top: 0;
+            z-index: 5;
+        }
+        /* Sticky Column 1: Ticker (Width ~85px) */
+        .frozen-table th:nth-child(1), .frozen-table td:nth-child(1) {
+            position: sticky;
+            left: 0px;
+            background-color: #121620;
+            min-width: 85px;
+            z-index: 4;
+            font-weight: 700;
+            border-right: 1px solid #232734;
+        }
+        /* Sticky Column 2: Asset Name (Width ~170px, starts at 85px) */
+        .frozen-table th:nth-child(2), .frozen-table td:nth-child(2) {
+            position: sticky;
+            left: 85px;
+            background-color: #121620;
+            min-width: 170px;
+            z-index: 4;
+            border-right: 1px solid #232734;
+        }
+        /* Sticky Column 3: 1 D/T/N (Yesterday/Today/Now, starts at 255px) */
+        .frozen-table th:nth-child(3), .frozen-table td:nth-child(3) {
+            position: sticky;
+            left: 255px;
+            background-color: #121620;
+            min-width: 220px;
+            z-index: 4;
+            font-weight: 600;
+            color: #60a5fa;
+            box-shadow: 4px 0 6px -2px rgba(0,0,0,0.45);
+            border-right: 2px solid #3b82f6;
+        }
+        .frozen-table th:nth-child(1), .frozen-table th:nth-child(2), .frozen-table th:nth-child(3) {
+            z-index: 10;
+            background-color: #1a2233;
+        }
+        .frozen-table tr:hover td {
+            background-color: #1f2737;
+        }
+    </style>
+    <div class="custom-grid-container">
+        <table class="frozen-table">
+            <thead>
+                <tr>
+    """
+    for col in paged_df.columns:
+        html_code += f"<th>{col}</th>"
+    html_code += "</tr></thead><tbody>"
+
+    for _, row in paged_df.iterrows():
+        html_code += "<tr>"
+        for _, val in row.items():
+            html_code += f"<td>{val}</td>"
+        html_code += "</tr>"
+    html_code += "</tbody></table></div>"
+
+    st.markdown(html_code, unsafe_allow_html=True)
 else:
     st.warning("No ticker profile data retrieved for active watchlist.")
 
 st.markdown("---")
 
-# --- SECTION 2: OPTIONS EXECUTION HUB (DUAL CREDIT / DEBIT ENGINES) ---
+# --- SECTION 2: OPTIONS EXECUTION HUB (FULL CREDIT / DEBIT STRATEGY CATALOG) ---
 st.subheader("2. Institutional Options Execution Hub (15 to 45 DTE Window)")
 st.caption("Quantitative screening matching Greeks, volatility regimes, and POP metrics.")
 
@@ -773,16 +1080,24 @@ CREDIT_STRATEGIES = [
     "Bull Put Credit Spread ($5-$10 Gap)",
     "Bear Call Credit Spread ($5-$10 Gap)",
     "Iron Condor (POP > 70%)",
+    "Iron Butterfly (High-Credit Pin)",
     "Covered Call / Buy-Write",
-    "Jade Lizard (Zero Upside Risk)"
+    "Cash-Secured Put (Target Buy)",
+    "Jade Lizard (Zero Upside Risk)",
+    "Short Strangle (High IV Seller)",
+    "Short Straddle (Maximum Premium)"
 ]
 
 DEBIT_STRATEGIES = [
     "Bull Call Debit Spread ($5-$10 Gap)",
     "Bear Put Debit Spread ($5-$10 Gap)",
+    "Long Directional Single Call",
+    "Long Directional Single Put",
     "Poor Man's Covered Call (PMCC)",
-    "Long Calendar Spread (Theta Decay)",
-    "Long Directional Single Call"
+    "Long Call Calendar Spread",
+    "Long Put Calendar Spread",
+    "Long Straddle (Volatility Expansion)",
+    "Long Strangle (Tail Risk Breakout)"
 ]
 
 hub_col1, hub_col2 = st.columns(2, gap="large")
@@ -840,8 +1155,9 @@ if go_debit:
 
 st.markdown("#### 📋 Strategy Execution Analysis Grid")
 
-REQUIRED_20_COLS = [
-    "Date", "M/E", "Stock", "Earnings", "Support", "Resistance", 
+# 19-Column Schema (M/E Removed)
+REQUIRED_19_COLS = [
+    "Date", "Stock", "Earnings", "Support", "Resistance", 
     "Stock Prediction", "Strategy", "Expiry", "#Contract", 
     "Long Put", "Short Put", "Short Call", "Long Call", 
     "Premium", "Total Premium", "Sold Idea", "Profit", "Loss", "Comments"
@@ -850,10 +1166,22 @@ REQUIRED_20_COLS = [
 if st.session_state.active_options_results:
     st.markdown(f"**Active Execution Matrix:** `{st.session_state.active_strategy_label}`")
     strat_df = pd.DataFrame(st.session_state.active_options_results)
-    for c in REQUIRED_20_COLS:
+    for c in REQUIRED_19_COLS:
         if c not in strat_df.columns:
             strat_df[c] = "—"
-    ordered_df = strat_df[REQUIRED_20_COLS]
+    ordered_df = strat_df[REQUIRED_19_COLS]
+    
+    # Quick Ticker Filter for Options Grid
+    all_opt_tickers = sorted(list(ordered_df["Stock"].unique()))
+    opt_quick_tickers = st.multiselect(
+        "🎯 Filter Tickers in Options Grid:",
+        options=all_opt_tickers,
+        default=[],
+        key="opt_quick_filter"
+    )
+    if opt_quick_tickers:
+        ordered_df = ordered_df[ordered_df["Stock"].isin(opt_quick_tickers)]
+
     filtered_strat_df = filter_dataframe(ordered_df, key_prefix="options_hub")
     st.dataframe(filtered_strat_df, use_container_width=True, hide_index=True)
     
